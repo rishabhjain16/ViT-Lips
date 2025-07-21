@@ -1,0 +1,13 @@
+# Core deep learning framework
+torch
+torchvision
+
+# For Vision Transformer models and image utilities
+timm
+opencv-python-headless
+
+# Numerical operations and data handling
+numpy
+
+# Utility for progress bars
+tqdm
