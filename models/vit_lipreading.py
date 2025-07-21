@@ -9,6 +9,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models import vit_b_16, ViT_B_16_Weights
 import logging
+try:
+    from torch.utils.checkpoint import checkpoint
+except ImportError:
+    checkpoint = None
 
 logger = logging.getLogger(__name__)
 
@@ -30,12 +34,14 @@ class ViTLipReading(nn.Module):
         pretrained=True,
         hidden_dim=256,
         dropout=0.1,
-        freeze_backbone=False
+        freeze_backbone=False,
+        use_gradient_checkpointing=True
     ):
         super().__init__()
         
         self.num_classes = num_classes
         self.hidden_dim = hidden_dim
+        self.use_gradient_checkpointing = use_gradient_checkpointing
         
         # Load pretrained ViT-B/16
         if pretrained:
@@ -45,6 +51,14 @@ class ViTLipReading(nn.Module):
         
         # Remove the classification head
         self.backbone.heads = nn.Identity()
+        
+        # Enable gradient checkpointing for the backbone if available
+        if self.use_gradient_checkpointing and hasattr(self.backbone, 'gradient_checkpointing_enable'):
+            try:
+                self.backbone.gradient_checkpointing_enable()
+                logger.info("Gradient checkpointing enabled for ViT backbone")
+            except Exception as e:
+                logger.warning(f"Could not enable gradient checkpointing: {e}")
         
         # Freeze backbone if requested
         if freeze_backbone:
@@ -80,45 +94,54 @@ class ViTLipReading(nn.Module):
             param.requires_grad = True
         logger.info("ViT backbone unfrozen")
     
-    def forward(self, videos, frame_batch_size=32):
+    def _backbone_forward_selective(self, frames):
+        """Selective gradient checkpointing - only checkpoint expensive transformer layers"""
+        if self.use_gradient_checkpointing and self.training:
+            # Process patch embedding WITHOUT checkpointing (cheap operations)
+            x = self.backbone.conv_proj(frames)
+            x = x.reshape(x.shape[0], x.shape[1], -1)
+            x = x.permute(0, 2, 1)
+            
+            # Add class token and position embeddings WITHOUT checkpointing
+            batch_size = x.shape[0]
+            cls_token = self.backbone.class_token.expand(batch_size, -1, -1)
+            x = torch.cat([cls_token, x], dim=1)
+            x = x + self.backbone.encoder.pos_embedding
+            x = self.backbone.encoder.dropout(x)
+            
+            # ONLY checkpoint transformer layers (memory expensive part)
+            for layer in self.backbone.encoder.layers:
+                x = checkpoint(layer, x, use_reentrant=False)
+            
+            # Final processing WITHOUT checkpointing
+            x = self.backbone.encoder.ln(x)
+            x = x[:, 0]  # Take CLS token
+            
+            return x
+        else:
+            return self.backbone(frames)
+    
+    def forward(self, videos):
         """
-        Forward pass
+        Forward pass with gradient checkpointing
         
         Args:
             videos: [B, C, T, H, W] video sequences
-            frame_batch_size: Number of frames to process at once to save memory
             
         Returns:
             logits: [B, T, num_classes] - logits for each timestep
         """
         B, C, T, H, W = videos.shape
         
-        # Process frames in smaller batches to save memory
-        frame_features_list = []
+        # Reshape: [B, C, T, H, W] -> [B*T, C, H, W] for batch processing
+        frames = videos.transpose(1, 2).contiguous()  # [B, T, C, H, W]
+        frames = frames.view(B * T, C, H, W)  # [B*T, C, H, W]
         
-        for b in range(B):
-            batch_features = []
-            video = videos[b]  # [C, T, H, W]
-            
-            # Process frames in chunks
-            for i in range(0, T, frame_batch_size):
-                end_idx = min(i + frame_batch_size, T)
-                frame_chunk = video[:, i:end_idx]  # [C, chunk_size, H, W]
-                chunk_size = frame_chunk.shape[1]
-                
-                # Reshape for ViT: [C, chunk_size, H, W] -> [chunk_size, C, H, W]
-                frames = frame_chunk.transpose(0, 1)  # [chunk_size, C, H, W]
-                
-                # Extract features using ViT backbone
-                chunk_features = self.backbone(frames)  # [chunk_size, 768]
-                batch_features.append(chunk_features)
-            
-            # Concatenate all chunks for this video
-            video_features = torch.cat(batch_features, dim=0)  # [T, 768]
-            frame_features_list.append(video_features)
+        # Extract features using ViT backbone with selective gradient checkpointing
+        frame_features = self._backbone_forward_selective(frames)
         
-        # Stack all videos: [B, T, 768]
-        frame_features = torch.stack(frame_features_list, dim=0)
+        # Reshape back: [B*T, 768] -> [B, T, 768]
+        frame_features = frame_features.view(B, T, -1)
         
         # Temporal encoding
         temporal_features = self.temporal_encoder(frame_features)  # [B, T, hidden_dim]
@@ -232,7 +255,7 @@ class ViTLipReading(nn.Module):
         return predictions
 
 
-def create_phoneme_model(pretrained=True, freeze_backbone=False):
+def create_phoneme_model(pretrained=True, freeze_backbone=False, use_gradient_checkpointing=True):
     """Create model for phoneme prediction"""
     # 40 phonemes + 1 blank token = 41 classes
     return ViTLipReading(
@@ -240,11 +263,12 @@ def create_phoneme_model(pretrained=True, freeze_backbone=False):
         pretrained=pretrained,
         hidden_dim=256,
         dropout=0.1,
-        freeze_backbone=freeze_backbone
+        freeze_backbone=freeze_backbone,
+        use_gradient_checkpointing=use_gradient_checkpointing
     )
 
 
-def create_word_model(vocab_size, pretrained=True, freeze_backbone=False):
+def create_word_model(vocab_size, pretrained=True, freeze_backbone=False, use_gradient_checkpointing=True):
     """Create model for word-level prediction"""
     # vocab_size + 1 blank token
     return ViTLipReading(
@@ -252,7 +276,8 @@ def create_word_model(vocab_size, pretrained=True, freeze_backbone=False):
         pretrained=pretrained,
         hidden_dim=256,
         dropout=0.1,
-        freeze_backbone=freeze_backbone
+        freeze_backbone=freeze_backbone,
+        use_gradient_checkpointing=use_gradient_checkpointing
     )
 
 

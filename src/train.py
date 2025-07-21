@@ -12,6 +12,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
+from torch.amp import autocast, GradScaler
+from tqdm import tqdm
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_AVAILABLE = True
@@ -47,6 +49,24 @@ def set_seed(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def log_to_file(log_file_path, epoch, batch_num, loss, avg_loss, lr=None, validation=False):
+    """Log training/validation losses to a text file"""
+    os.makedirs(os.path.dirname(log_file_path), exist_ok=True)
+    
+    mode = 'a' if os.path.exists(log_file_path) else 'w'
+    with open(log_file_path, mode) as f:
+        if mode == 'w':
+            # Write header for new file
+            f.write("timestamp,epoch,batch,loss,avg_loss,lr,type\n")
+        
+        import datetime
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_type = "validation" if validation else "training"
+        lr_str = f"{lr:.6f}" if lr is not None else "N/A"
+        
+        f.write(f"{timestamp},{epoch},{batch_num},{loss:.6f},{avg_loss:.6f},{lr_str},{log_type}\n")
 
 
 def collate_fn(batch):
@@ -85,52 +105,97 @@ def collate_fn(batch):
 
 
 def train_epoch(model, dataloader, optimizer, device, epoch, args):
-    """Train for one epoch with gradient accumulation"""
+    """Train for one epoch with gradient accumulation and mixed precision"""
     model.train()
     total_loss = 0
     num_batches = 0
+    running_loss = 0  # For running average
+    samples_processed = 0
     
-    for batch_idx, batch in enumerate(dataloader):
+    # Initialize gradient scaler for mixed precision
+    scaler = GradScaler(enabled=args.use_amp)
+    
+    # Create progress bar
+    pbar = tqdm(dataloader, desc=f"Epoch {epoch}", 
+                unit="batch", dynamic_ncols=True)
+    
+    for batch_idx, batch in enumerate(pbar):
         videos = batch['videos'].to(device)
         targets = batch['targets'].to(device)
         target_lengths = batch['target_lengths'].to(device)
         input_lengths = batch['input_lengths'].to(device)
         
-        # Forward pass
-        loss = model.compute_ctc_loss(videos, targets, target_lengths, input_lengths)
+        batch_size = videos.size(0)
+        samples_processed += batch_size
         
-        # Scale loss by accumulation steps
-        loss = loss / args.gradient_accumulation_steps
+        # Forward pass with mixed precision
+        with autocast(device_type='cuda' if device.type == 'cuda' else 'cpu', enabled=args.use_amp):
+            loss = model.compute_ctc_loss(videos, targets, target_lengths, input_lengths)
+            
+            # Scale loss by accumulation steps
+            loss = loss / args.gradient_accumulation_steps
         
-        # Backward pass
-        loss.backward()
+        # Backward pass with scaler
+        scaler.scale(loss).backward()
         
         # Update weights every gradient_accumulation_steps
         if (batch_idx + 1) % args.gradient_accumulation_steps == 0:
-            # Gradient clipping
+            # Gradient clipping with scaler
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             
-            # Update weights
-            optimizer.step()
+            # Update weights with scaler
+            scaler.step(optimizer)
+            scaler.update()
             optimizer.zero_grad()
         
-        total_loss += loss.item() * args.gradient_accumulation_steps  # Unscale for logging
+        # Track losses
+        current_loss = loss.item() * args.gradient_accumulation_steps
+        total_loss += current_loss
+        running_loss = 0.9 * running_loss + 0.1 * current_loss  # Exponential moving average
         num_batches += 1
         
-        # Log progress
-        if batch_idx % args.log_interval == 0:
-            if torch.cuda.is_available():
-                memory_used = torch.cuda.memory_allocated() / 1024**3  # GB
-                memory_cached = torch.cuda.memory_reserved() / 1024**3  # GB
-                logger.info(f'Epoch {epoch}, Batch {batch_idx}/{len(dataloader)}, '
-                           f'Loss: {loss.item() * args.gradient_accumulation_steps:.4f}, '
-                           f'GPU Memory: {memory_used:.1f}GB used, {memory_cached:.1f}GB cached')
-            else:
-                logger.info(f'Epoch {epoch}, Batch {batch_idx}/{len(dataloader)}, '
-                           f'Loss: {loss.item() * args.gradient_accumulation_steps:.4f}')
+        # Update progress bar
+        if torch.cuda.is_available():
+            memory_used = torch.cuda.memory_allocated() / 1024**3
+            memory_cached = torch.cuda.memory_reserved() / 1024**3
+            pbar.set_postfix({
+                'Loss': f'{current_loss:.3f}',
+                'Avg': f'{running_loss:.3f}',
+                'GPU': f'{memory_used:.1f}GB/{memory_cached:.1f}GB',
+                'Samples': f'{samples_processed:,}'
+            })
+        else:
+            pbar.set_postfix({
+                'Loss': f'{current_loss:.3f}',
+                'Avg': f'{running_loss:.3f}',
+                'Samples': f'{samples_processed:,}'
+            })
+        
+        # Sample-based checkpoint saving
+        if samples_processed % args.save_every_samples == 0:
+            save_checkpoint(
+                model, optimizer, None, epoch, current_loss,
+                os.path.join(args.output_dir, f'checkpoint_samples_{samples_processed}.pth')
+            )
+            logger.info(f"Saved checkpoint after {samples_processed:,} samples")
+        
+        # Regular logging (less frequent now with tqdm)
+        if batch_idx % (args.log_interval * 10) == 0:  # Log every 100 batches instead of 10
+            progress_pct = (batch_idx / len(dataloader)) * 100
+            logger.info(f'Epoch {epoch}, Batch {batch_idx}/{len(dataloader)} ({progress_pct:.1f}%), '
+                       f'Loss: {current_loss:.4f} (avg: {running_loss:.4f}), '
+                       f'Samples: {samples_processed:,}')
+            
+            # Log to text file
+            if hasattr(args, 'output_dir'):
+                log_file = os.path.join(args.output_dir, 'training_log.txt')
+                current_lr = optimizer.param_groups[0]['lr'] if hasattr(optimizer, 'param_groups') else None
+                log_to_file(log_file, epoch, batch_idx, current_loss, running_loss, current_lr)
     
+    pbar.close()
     avg_loss = total_loss / max(1, num_batches)
-    logger.info(f'Epoch {epoch} completed - Average Loss: {avg_loss:.4f}')
+    logger.info(f'Epoch {epoch} completed - Average Loss: {avg_loss:.4f}, Total Samples: {samples_processed:,}')
     return avg_loss
 
 
@@ -140,8 +205,11 @@ def validate_epoch(model, dataloader, device):
     total_loss = 0
     num_batches = 0
     
+    # Create progress bar for validation
+    pbar = tqdm(dataloader, desc="Validation", unit="batch", dynamic_ncols=True)
+    
     with torch.no_grad():
-        for batch in dataloader:
+        for batch in pbar:
             videos = batch['videos'].to(device)
             targets = batch['targets'].to(device)
             target_lengths = batch['target_lengths'].to(device)
@@ -150,7 +218,12 @@ def validate_epoch(model, dataloader, device):
             loss = model.compute_ctc_loss(videos, targets, target_lengths, input_lengths)
             total_loss += loss.item()
             num_batches += 1
+            
+            # Update progress bar
+            avg_loss_so_far = total_loss / num_batches
+            pbar.set_postfix({'Val Loss': f'{avg_loss_so_far:.4f}'})
     
+    pbar.close()
     avg_loss = total_loss / max(1, num_batches)
     logger.info(f'Validation Loss: {avg_loss:.4f}')
     return avg_loss
@@ -231,6 +304,10 @@ def main():
                        help='Use pretrained ViT backbone')
     parser.add_argument('--freeze_backbone', action='store_true',
                        help='Freeze ViT backbone (train only head)')
+    parser.add_argument('--gradient_checkpointing', action='store_true', default=True,
+                       help='Use gradient checkpointing to save memory')
+    parser.add_argument('--use_amp', action='store_true', default=True,
+                       help='Use automatic mixed precision (AMP) to save memory')
     
     # Training arguments
     parser.add_argument('--batch_size', type=int, default=1,
@@ -264,6 +341,8 @@ def main():
                        help='Log every N batches')
     parser.add_argument('--save_interval', type=int, default=1,
                        help='Save checkpoint every N epochs')
+    parser.add_argument('--save_every_samples', type=int, default=5000,
+                       help='Save checkpoint every N samples processed')
     
     args = parser.parse_args()
     
@@ -330,7 +409,8 @@ def main():
     if args.label_type == 'phn':
         model = create_phoneme_model(
             pretrained=args.pretrained,
-            freeze_backbone=args.freeze_backbone
+            freeze_backbone=args.freeze_backbone,
+            use_gradient_checkpointing=args.gradient_checkpointing
         )
     else:
         # For word-level, you'd need to determine vocabulary size
@@ -338,7 +418,8 @@ def main():
         model = create_word_model(
             vocab_size=vocab_size,
             pretrained=args.pretrained,
-            freeze_backbone=args.freeze_backbone
+            freeze_backbone=args.freeze_backbone,
+            use_gradient_checkpointing=args.gradient_checkpointing
         )
     
     model = model.to(device)
@@ -378,6 +459,11 @@ def main():
         
         # Validate
         val_loss = validate_epoch(model, val_loader, device)
+        
+        # Log validation loss to text file
+        log_file = os.path.join(args.output_dir, 'training_log.txt')
+        current_lr = optimizer.param_groups[0]['lr'] if scheduler else None
+        log_to_file(log_file, epoch, -1, val_loss, val_loss, current_lr, validation=True)
         
         # Step scheduler
         if scheduler:
