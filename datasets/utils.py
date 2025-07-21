@@ -9,21 +9,33 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
-def load_audio(audio_path, target_sample_rate=16000):
+def load_audio(audio_path, target_sample_rate=16000, use_logfbank=False):
     """
-    Load audio file using librosa
+    Load audio file using librosa, optionally extract logfbank features
     
     Args:
         audio_path: Path to audio file (.wav)
         target_sample_rate: Target sample rate for audio
+        use_logfbank: If True, extract log filterbank features; if False, return raw audio
         
     Returns:
-        audio: numpy array of audio samples
+        audio: numpy array of audio samples or logfbank features
         sample_rate: sample rate of the audio
     """
     try:
         import librosa
         audio, sr = librosa.load(audio_path, sr=target_sample_rate)
+        
+        if use_logfbank:
+            try:
+                from python_speech_features import logfbank
+                # Convert to log filterbank features (better for speech)
+                audio_feats = logfbank(audio, samplerate=sr).astype(np.float32)
+                logger.debug(f"Loaded logfbank features: {audio_feats.shape} from {audio_path}")
+                return audio_feats, sr
+            except ImportError:
+                logger.warning("python_speech_features not installed - using raw audio. Install with: pip install python_speech_features")
+                
         logger.debug(f"Loaded audio: {audio.shape} @{sr}Hz from {audio_path}")
         return audio, sr
     except ImportError:

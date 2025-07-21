@@ -1,16 +1,26 @@
 # Core deep learning framework
-torch
-torchvision
+torch>=1.12.0
+torchvision>=0.13.0
 
-# For Vision Transformer models and image utilities
-timm
-opencv-python-headless
+# Computer vision and video processing
+opencv-python-headless>=4.5.0
 
-# Audio processing
-librosa
+# Audio processing (optional, for audio features)
+librosa>=0.9.0
+python_speech_features>=0.6
 
 # Numerical operations and data handling
-numpy
+numpy>=1.21.0
 
-# Utility for progress bars
-tqdm
+# TensorBoard for training visualization
+tensorboard>=2.8.0
+
+# Progress bars and utilities
+tqdm>=4.64.0
+
+# Standard library (usually included with Python)
+# argparse - built-in
+# logging - built-in
+# os - built-in
+# sys - built-in
+# random - built-in

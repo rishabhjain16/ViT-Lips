@@ -29,8 +29,10 @@ class LipReadingDataset(Dataset):
         label_type='phn',  # 'phn' for phonemes, 'wrd' for words/sentences
         image_size=224,
         transform=None,
-        load_audio=False,  # Set to True if you want audio loading in future
-        mask_prob=0.0      # Probability for masking frames (0.0 = no masking)
+        load_audio=False,  # Set to True if you want audio loading
+        use_logfbank=False,  # Set to True to extract logfbank features instead of raw audio
+        mask_prob=0.0,     # Probability for masking frames (0.0 = no masking)
+        verify_alignment=True  # Whether to verify audio-video duration alignment
     ):
         """
         Args:
@@ -39,8 +41,10 @@ class LipReadingDataset(Dataset):
             label_type: Type of labels ('phn' for phonemes, 'wrd' for words)
             image_size: Size to resize frames to
             transform: Optional transform to apply to frames
-            load_audio: Whether to load audio data (placeholder for future)
+            load_audio: Whether to load audio data
+            use_logfbank: Whether to extract logfbank features (requires python_speech_features)
             mask_prob: Probability for random frame masking during training
+            verify_alignment: Whether to verify audio-video duration alignment
         """
         self.data_dir = data_dir
         self.split = split
@@ -48,6 +52,7 @@ class LipReadingDataset(Dataset):
         self.image_size = image_size
         self.transform = transform
         self.load_audio = load_audio
+        self.use_logfbank = use_logfbank
         self.mask_prob = mask_prob
         
         # File paths
@@ -68,7 +73,27 @@ class LipReadingDataset(Dataset):
             else:
                 logger.warning(f"Phoneme dictionary not found at {dict_path}")
         
+        # Verify audio-video alignment if requested
+        if verify_alignment and self.load_audio:
+            self.verify_alignment()
+        
         logger.info(f"Initialized {split} dataset with {len(self)} samples")
+    
+    def verify_alignment(self, tol=0.1):
+        """Verify audio-video duration alignment"""
+        mismatched = 0
+        for i in range(len(self.video_info)):
+            file_id, video_path, audio_path, num_frames, audio_samples = self.video_info[i]
+            video_dur = num_frames / 25.0  # Assuming 25fps
+            audio_dur = audio_samples / 16000.0  # 16kHz
+            if abs(video_dur - audio_dur) > tol:
+                mismatched += 1
+                if mismatched <= 3:  # Show first 3 examples
+                    logger.warning(f"Duration mismatch in {file_id}: video={video_dur:.2f}s, audio={audio_dur:.2f}s")
+        if mismatched > 0:
+            logger.warning(f"Found {mismatched}/{len(self.video_info)} samples with mismatched durations (>{tol}s)")
+        else:
+            logger.info("All audio-video durations are aligned")
     
     def __len__(self):
         return len(self.video_info)
@@ -89,10 +114,10 @@ class LipReadingDataset(Dataset):
         if self.transform is not None:
             frames = self.transform(frames)
         
-        # Load audio if requested (placeholder for now)
+        # Load audio if requested
         audio_data = None
         if self.load_audio:
-            audio_data, sample_rate = load_audio(audio_path)
+            audio_data, sample_rate = load_audio(audio_path, use_logfbank=self.use_logfbank)
         
         # Process label based on type
         if self.label_type == 'phn' and self.phoneme_dict is not None:

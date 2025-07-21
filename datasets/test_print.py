@@ -10,7 +10,7 @@ def test_split(data_dir, split):
     
     # PHONEME mode
     print("PHONEME:")
-    dataset_phn = LipReadingDataset(data_dir=data_dir, split=split, label_type="phn", load_audio=True)
+    dataset_phn = LipReadingDataset(data_dir=data_dir, split=split, label_type="phn", load_audio=True, use_logfbank=False)
     
     if len(dataset_phn) > 0:
         sample = dataset_phn[0]
@@ -19,13 +19,26 @@ def test_split(data_dir, split):
         print("  Converted: " + str(sample["label"]))
         print("  Video: " + str(sample["video"].shape))
         if sample["audio"] is not None:
-            print("  Audio: " + str(sample["audio"].shape))
+            print("  Audio (raw): " + str(sample["audio"].shape))
         else:
             print("  Audio: None")
     
+    # Test LOGFBANK features
+    print("PHONEME (logfbank):")
+    try:
+        dataset_phn_logfbank = LipReadingDataset(data_dir=data_dir, split=split, label_type="phn", load_audio=True, use_logfbank=True)
+        if len(dataset_phn_logfbank) > 0:
+            sample = dataset_phn_logfbank[0]
+            if sample["audio"] is not None:
+                print("  Audio (logfbank): " + str(sample["audio"].shape))
+            else:
+                print("  Audio (logfbank): None")
+    except Exception as e:
+        print("  Audio (logfbank): Error - " + str(e)[:50] + "...")
+    
     # SENTENCE mode  
     print("SENTENCE:")
-    dataset_wrd = LipReadingDataset(data_dir=data_dir, split=split, label_type="wrd", load_audio=True)
+    dataset_wrd = LipReadingDataset(data_dir=data_dir, split=split, label_type="wrd", load_audio=True, use_logfbank=False)
     
     if len(dataset_wrd) > 0:
         sample = dataset_wrd[0]
