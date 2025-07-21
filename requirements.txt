@@ -6,6 +6,9 @@ torchvision
 timm
 opencv-python-headless
 
+# Audio processing
+librosa
+
 # Numerical operations and data handling
 numpy
 
