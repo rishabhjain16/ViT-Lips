@@ -124,17 +124,15 @@ def train_epoch(model, dataloader, optimizer, device, epoch, args):
         targets = batch['targets'].to(device)
         target_lengths = batch['target_lengths'].to(device)
         input_lengths = batch['input_lengths'].to(device)
-        
+
         batch_size = videos.size(0)
         samples_processed += batch_size
-        
+
         # Forward pass with mixed precision
         with autocast(device_type='cuda' if device.type == 'cuda' else 'cpu', enabled=args.use_amp):
             loss = model.compute_ctc_loss(videos, targets, target_lengths, input_lengths)
-            
-            # Scale loss by accumulation steps
             loss = loss / args.gradient_accumulation_steps
-        
+
         # Backward pass with scaler
         scaler.scale(loss).backward()
         
@@ -148,6 +146,18 @@ def train_epoch(model, dataloader, optimizer, device, epoch, args):
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
+            
+            # CONSERVATIVE MEMORY CLEANUP: Only when memory usage is high
+            if torch.cuda.is_available():
+                memory_used_gb = torch.cuda.memory_allocated() / 1024**3
+                if memory_used_gb > 15.0:  # Only clean if using >15GB
+                    torch.cuda.empty_cache()
+        
+        # Emergency cleanup every 1000 batches to prevent fragmentation buildup
+        if batch_idx % 1000 == 0 and torch.cuda.is_available():
+            memory_used_gb = torch.cuda.memory_allocated() / 1024**3
+            if memory_used_gb > 10.0:  # Only if really needed
+                torch.cuda.empty_cache()
         
         # Track losses
         current_loss = loss.item() * args.gradient_accumulation_steps
@@ -302,8 +312,8 @@ def main():
     # Model arguments
     parser.add_argument('--pretrained', action='store_true', default=True,
                        help='Use pretrained ViT backbone')
-    parser.add_argument('--freeze_backbone', action='store_true',
-                       help='Freeze ViT backbone (train only head)')
+    # parser.add_argument('--freeze_backbone', action='store_true',
+    #                    help='Freeze ViT backbone (train only head)')
     parser.add_argument('--gradient_checkpointing', action='store_true', default=True,
                        help='Use gradient checkpointing to save memory')
     parser.add_argument('--use_amp', action='store_true', default=True,
@@ -366,21 +376,26 @@ def main():
     
     # Create datasets
     logger.info("Loading datasets...")
-    
+
     train_dataset = LipReadingDataset(
         data_dir=args.data_root,
         split='train',
         label_type=args.label_type,
         load_audio=args.load_audio
     )
-    
+
+    # DEBUG: Overfit experiment - use only 2 samples for training
+    train_dataset = torch.utils.data.Subset(train_dataset, [0, 1])
+
     val_dataset = LipReadingDataset(
         data_dir=args.data_root,
         split='valid',
         label_type=args.label_type,
         load_audio=args.load_audio
     )
-    
+    # Optionally, also restrict validation set
+    val_dataset = torch.utils.data.Subset(val_dataset, [0, 1])
+
     logger.info(f"Train samples: {len(train_dataset)}")
     logger.info(f"Val samples: {len(val_dataset)}")
     
@@ -409,7 +424,7 @@ def main():
     if args.label_type == 'phn':
         model = create_phoneme_model(
             pretrained=args.pretrained,
-            freeze_backbone=args.freeze_backbone,
+            freeze_backbone=False,
             use_gradient_checkpointing=args.gradient_checkpointing
         )
     else:
@@ -418,7 +433,7 @@ def main():
         model = create_word_model(
             vocab_size=vocab_size,
             pretrained=args.pretrained,
-            freeze_backbone=args.freeze_backbone,
+            freeze_backbone=False,
             use_gradient_checkpointing=args.gradient_checkpointing
         )
     

@@ -59,7 +59,7 @@ def test_dataset_loading():
         logger.info("Testing dataset loading...")
         
         # This will only work if you have the dataset
-        data_root = "/home/rishabh/Desktop/Datasets/LRS3"
+        data_root = "/home/rishabh/Desktop/Datasets/lrs3/30h_data"
         
         if not os.path.exists(data_root):
             logger.warning(f"Dataset not found at {data_root}, skipping dataset test")
@@ -67,8 +67,8 @@ def test_dataset_loading():
         
         # Test dataset creation
         dataset = LipReadingDataset(
-            data_root=data_root,
-            split='train',
+            data_dir=data_root,
+            split='test',
             label_type='phn',
             load_audio=False
         )
@@ -77,12 +77,13 @@ def test_dataset_loading():
         
         # Test loading a sample
         sample = dataset[0]
-        video, label, video_path = sample
-        
+        video = sample['video']
+        label = sample['label']
+        video_path = sample['video_path']
+
         logger.info(f"Sample video shape: {video.shape}")
-        logger.info(f"Sample label length: {len(label)}")
+        logger.info(f"Sample label length: {len(label) if hasattr(label, '__len__') else 'N/A'}")
         logger.info(f"Sample video path: {os.path.basename(video_path)}")
-        
         logger.info("✅ Dataset loading test passed!")
         return True
         

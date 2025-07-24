@@ -4,13 +4,13 @@
 set -e  # Exit on error
 
 # Default values
-DATA_ROOT="/home/rishabh/Desktop/Datasets/lrs3/433h_data_full_face"
-OUTPUT_DIR="./outputs"
-BATCH_SIZE=2
-GRADIENT_ACCUMULATION_STEPS=4
+DATA_ROOT="/home/rishabh/Desktop/Datasets/lrs3/30h_data"
+OUTPUT_DIR="./outputs/3"
+BATCH_SIZE=1
+GRADIENT_ACCUMULATION_STEPS=16
 EPOCHS=10
 LR=1e-4
-SAVE_EVERY_SAMPLES=5000
+SAVE_EVERY_SAMPLES=50000
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do

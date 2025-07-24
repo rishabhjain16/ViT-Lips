@@ -4,10 +4,10 @@
 # Usage: ./run_inference.sh [options]
 
 # Default parameters
-DATA_ROOT="${DATA_ROOT:-./datasets/PHOENIX2014T}"
-CHECKPOINT_PATH=""
+DATA_ROOT="/home/rishabh/Desktop/Datasets/lrs3/433h_data_full_face"
+CHECKPOINT_PATH="/home/rishabh/Desktop/Experiments/ViT-Lips/outputs/2/checkpoint_samples_150000.pth"
 OUTPUT_DIR="${OUTPUT_DIR:-./outputs/inference}"
-BATCH_SIZE="${BATCH_SIZE:-4}"
+BATCH_SIZE="${BATCH_SIZE:-1}"
 DEVICE="${DEVICE:-cuda}"
 
 # Parse command line arguments

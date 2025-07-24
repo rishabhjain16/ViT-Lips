@@ -16,11 +16,51 @@ project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(project_root)
 
 from models.vit_lipreading import create_phoneme_model, create_word_model
-from datasets.utils import load_video
+from datasets.utils import load_phoneme_dict
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+def load_video(video_path, image_size=224):
+    """
+    Load video frames using OpenCV
+    
+    Args:
+        video_path: Path to video file
+        image_size: Size to resize frames to
+        
+    Returns:
+        frames: List of numpy arrays [H, W, C]
+    """
+    if not os.path.exists(video_path):
+        raise FileNotFoundError(f"Video file not found: {video_path}")
+    
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise ValueError(f"Cannot open video: {video_path}")
+    
+    frames = []
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        # Convert BGR to RGB
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
+        # Resize frame
+        frame = cv2.resize(frame, (image_size, image_size))
+        frames.append(frame)
+    
+    cap.release()
+    
+    if len(frames) == 0:
+        raise ValueError(f"No frames loaded from: {video_path}")
+    
+    logger.info(f"Loaded {len(frames)} frames from {video_path}")
+    return frames
 
 
 def load_model(checkpoint_path, label_type='phn', device='cpu'):
@@ -50,30 +90,17 @@ def load_model(checkpoint_path, label_type='phn', device='cpu'):
 def preprocess_video(video_path, target_fps=25, target_size=(224, 224)):
     """Preprocess video for inference"""
     
-    frames = load_video(video_path)
+    frames = load_video(video_path, image_size=target_size[0])
     if frames is None or len(frames) == 0:
         raise ValueError(f"Could not load video: {video_path}")
     
     # Convert to numpy array
     frames = np.array(frames)  # [T, H, W, C]
     
-    # Resize frames
-    resized_frames = []
-    for frame in frames:
-        resized = cv2.resize(frame, target_size)
-        resized_frames.append(resized)
-    
-    frames = np.array(resized_frames)  # [T, H, W, C]
-    
     # Convert to tensor and normalize
     frames = torch.from_numpy(frames).float()  # [T, H, W, C]
     frames = frames.permute(0, 3, 1, 2)  # [T, C, H, W]
     frames = frames / 255.0  # Normalize to [0, 1]
-    
-    # Normalize using ImageNet stats (since we use pretrained ViT)
-    mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
-    std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
-    frames = (frames - mean) / std
     
     # Add batch dimension: [T, C, H, W] -> [1, C, T, H, W]
     frames = frames.transpose(0, 1).unsqueeze(0)
@@ -104,7 +131,7 @@ def decode_predictions(predictions, label_type='phn', phoneme_dict=None):
         return [' '.join([f'WORD_{idx}' for idx in pred_seq]) for pred_seq in predictions]
 
 
-def predict_video(model, video_path, device, label_type='phn'):
+def predict_video(model, video_path, device, label_type='phn', phoneme_dict=None):
     """Predict lip reading for a single video"""
     
     try:
@@ -116,10 +143,16 @@ def predict_video(model, video_path, device, label_type='phn'):
         
         # Predict
         with torch.no_grad():
+            # Get raw logits and log probabilities
+            raw_logits = model.forward(video_tensor)
+            log_probs = model.get_log_probs(video_tensor)
+            logger.info(f"Raw logits shape: {raw_logits.shape}")
+            logger.info(f"Raw logits (first frame): {raw_logits[0,0,:].cpu().numpy()}")
+            logger.info(f"Log probs (first frame): {log_probs[0,0,:].cpu().numpy()}")
             predictions = model.decode_greedy(video_tensor)
-        
+            logger.info(f"Predictions: {predictions}")
         # Decode predictions
-        decoded = decode_predictions(predictions, label_type, phoneme_dict=None)
+        decoded = decode_predictions(predictions, label_type, phoneme_dict=phoneme_dict)
         
         return decoded[0] if decoded else ""
         
@@ -130,6 +163,14 @@ def predict_video(model, video_path, device, label_type='phn'):
 
 def main():
     parser = argparse.ArgumentParser(description='Inference for ViT Lip Reading Model')
+    
+    # Data arguments
+    parser.add_argument('--data_root', type=str,
+                       help='Path to dataset directory (for loading phoneme dictionary)')
+    parser.add_argument('--output_dir', type=str, default='./outputs/inference',
+                       help='Output directory for results')
+    parser.add_argument('--batch_size', type=int, default=1,
+                       help='Batch size for inference (currently not used)')
     
     # Model arguments
     parser.add_argument('--checkpoint', type=str, required=True,
@@ -163,6 +204,19 @@ def main():
     model = load_model(args.checkpoint, args.label_type, device)
     logger.info("Model loaded successfully")
     
+    # Load phoneme dictionary if using phonemes and data_root is provided
+    phoneme_dict = None
+    if args.label_type == 'phn' and args.data_root:
+        dict_path = os.path.join(args.data_root, "dict.phn.txt")
+        if os.path.exists(dict_path):
+            try:
+                phoneme_dict = load_phoneme_dict(dict_path)
+                logger.info(f"Loaded phoneme dictionary with {len(phoneme_dict)} phonemes")
+            except Exception as e:
+                logger.warning(f"Failed to load phoneme dictionary: {e}")
+        else:
+            logger.warning(f"Phoneme dictionary not found at {dict_path}")
+    
     # Collect video files
     video_files = []
     if args.video:
@@ -181,8 +235,38 @@ def main():
             logger.error(f"Video directory not found: {args.video_dir}")
             return
     
+    elif args.data_root:
+        # If no specific video provided, read from TSV manifest files
+        logger.info("No specific video provided, reading video paths from dataset manifests...")
+        
+        # Try test split first, then valid split
+        for split in ['test', 'valid']:
+            tsv_path = os.path.join(args.data_root, f"{split}.tsv")
+            if os.path.exists(tsv_path):
+                logger.info(f"Reading video paths from {tsv_path}")
+                
+                with open(tsv_path, 'r') as f:
+                    lines = f.readlines()
+                
+                # Skip header (root path)
+                for i, line in enumerate(lines[1:6]):  # Take first 5 videos as samples
+                    parts = line.strip().split('\t')
+                    if len(parts) >= 2:
+                        video_path = parts[1]  # Second column is video path
+                        if os.path.exists(video_path):
+                            video_files.append(video_path)
+                            logger.info(f"Found video: {os.path.basename(video_path)}")
+                        else:
+                            logger.warning(f"Video file not found: {video_path}")
+                
+                if video_files:
+                    break  # Found videos, no need to check other splits
+        
+        if not video_files:
+            logger.warning("No valid video files found in dataset manifests")
+    
     else:
-        logger.error("Please provide either --video or --video_dir")
+        logger.error("Please provide either --video, --video_dir, or --data_root to find sample videos")
         return
     
     if not video_files:
@@ -197,7 +281,7 @@ def main():
     for video_path in video_files:
         logger.info(f"Processing: {os.path.basename(video_path)}")
         
-        prediction = predict_video(model, video_path, device, args.label_type)
+        prediction = predict_video(model, video_path, device, args.label_type, phoneme_dict)
         
         if prediction is not None:
             result = {
